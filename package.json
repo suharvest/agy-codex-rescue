@@ -1,0 +1,36 @@
+{
+  "name": "agy-codex-rescue",
+  "version": "1.0.0",
+  "description": "Safe, sandboxed bridge between Antigravity (agy) agent workflows and OpenAI Codex CLI",
+  "type": "module",
+  "bin": {
+    "codex-rescue": "./bin/codex-rescue"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "skills",
+    "LICENSE",
+    "README.md",
+    "README_CN.md",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "test": "node tests/test_offline.mjs",
+    "smoke": "bash tests/smoke_test.sh"
+  },
+  "keywords": [
+    "antigravity",
+    "codex",
+    "agent",
+    "ai",
+    "sandbox",
+    "rescue",
+    "cli"
+  ],
+  "author": "harvest",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
