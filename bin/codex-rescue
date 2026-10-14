@@ -1,0 +1,394 @@
+#!/usr/bin/env node
+
+import fs from 'node:fs';
+import path from 'node:path';
+import process from 'node:process';
+import { fileURLToPath } from 'node:url';
+
+import { executeTask, executeReview, checkSetup } from '../lib/engine.mjs';
+import { getJob, listJobs, getLatestJob } from '../lib/state.mjs';
+import {
+  formatMarkdownReport,
+  formatJobStatus,
+  formatJobList,
+  formatSetupReport,
+  cleanStderr
+} from '../lib/render.mjs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Read package version
+let packageVersion = '1.0.0';
+try {
+  const pkgPath = path.join(__dirname, '..', 'package.json');
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  packageVersion = pkg.version || '1.0.0';
+} catch {
+  // ignore
+}
+
+/**
+ * Print help manual
+ */
+function printHelp() {
+  console.log(`codex-rescue v${packageVersion}
+Safe, sandboxed bridge between Antigravity (agy) agent workflows and OpenAI Codex CLI.
+
+USAGE:
+  codex-rescue <command> [options]
+
+COMMANDS:
+  task "<prompt>" [options]   Execute an analytical or coding task via Codex
+  review [options]            Run a code review against working tree or base branch
+  status [job-id]             Show status and metadata for a job (default: latest)
+  result [job-id]             Print the saved response for a job (default: latest)
+  list [options]              List recent jobs recorded in the state store
+  setup [options]             Check Codex, Node.js, and environment readiness
+  help, --help, -h            Show this help reference
+  --version, -v               Print version number
+
+OPTIONS FOR 'task':
+  --write                     Enable workspace-write sandbox (DEFAULT: strict read-only)
+  --resume [job-id]           Resume previous Codex session (default: latest in workspace)
+  --fresh                     Force a fresh session (do not resume)
+  --model <name>              Specify Codex model to use (e.g. o3-mini)
+  --effort <low|medium|high>  Set model reasoning effort level
+  --dir <path>                Target workspace directory (default: current directory)
+  --json                      Output raw JSON results for machine/tool integration
+
+OPTIONS FOR 'review':
+  --scope <auto|working-tree|branch>
+                              Scope of code review (default: auto)
+  --base <ref>                Base commit/branch to compare against (default: HEAD~1)
+  --dir <path>                Target repository directory
+  --json                      Output raw JSON results
+
+EXAMPLES:
+  # Safe read-only diagnosis of an issue
+  codex-rescue task "Analyze tests/auth.test.js and explain why it times out"
+
+  # Authorize code modification in workspace-write sandbox
+  codex-rescue task "Fix the timeout bug in auth.test.js" --write
+
+  # Resume previous session to ask follow-up questions
+  codex-rescue task "Did we introduce any memory leak?" --resume
+
+  # Review uncommitted changes before git commit
+  codex-rescue review --scope working-tree
+
+  # Check installation and authorization status
+  codex-rescue setup
+`);
+}
+
+/**
+ * Read all text from stdin if piped
+ */
+async function readStdin() {
+  if (process.stdin.isTTY) {
+    return '';
+  }
+  return new Promise((resolve) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => { data += chunk; });
+    process.stdin.on('end', () => resolve(data.trim()));
+    process.stdin.on('error', () => resolve(''));
+  });
+}
+
+/**
+ * Main CLI entrypoint
+ */
+async function main() {
+  const rawArgs = process.argv.slice(2);
+
+  if (rawArgs.length === 0 || rawArgs.includes('--help') || rawArgs.includes('-h') || rawArgs[0] === 'help') {
+    printHelp();
+    process.exit(0);
+  }
+
+  if (rawArgs.includes('--version') || rawArgs.includes('-v')) {
+    console.log(`codex-rescue v${packageVersion}`);
+    process.exit(0);
+  }
+
+  const command = rawArgs[0];
+  const args = rawArgs.slice(1);
+
+  switch (command) {
+    case 'task': {
+      let prompt = '';
+      let write = false;
+      let resume = null;
+      let fresh = false;
+      let model = null;
+      let effort = null;
+      let json = false;
+      let dir = process.cwd();
+
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--write') {
+          write = true;
+        } else if (arg === '--fresh') {
+          fresh = true;
+        } else if (arg === '--json') {
+          json = true;
+        } else if (arg === '--resume') {
+          // Check if next arg is a job ID or another flag
+          const next = args[i + 1];
+          if (next && !next.startsWith('-')) {
+            resume = next;
+            i++;
+          } else {
+            resume = true; // use latest in workspace
+          }
+        } else if (arg === '--model') {
+          model = args[++i];
+        } else if (arg === '--effort') {
+          effort = args[++i];
+        } else if (arg === '--dir') {
+          dir = args[++i];
+        } else if (!arg.startsWith('-')) {
+          if (!prompt) {
+            prompt = arg;
+          } else {
+            prompt += ' ' + arg;
+          }
+        } else {
+          console.error(`Error: Unknown flag '${arg}'. Run 'codex-rescue help' for usage.`);
+          process.exit(2);
+        }
+      }
+
+      if (!prompt) {
+        const stdinData = await readStdin();
+        if (stdinData) {
+          prompt = stdinData;
+        }
+      }
+
+      if (!prompt) {
+        console.error('Error: No prompt provided. Provide instructions as an argument or pipe via stdin.');
+        process.exit(2);
+      }
+
+      try {
+        const result = await executeTask({
+          prompt,
+          write,
+          resume,
+          fresh,
+          model,
+          effort,
+          dir
+        });
+
+        if (json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          const report = formatMarkdownReport({
+            job: result.job,
+            prompt,
+            resultText: result.resultText,
+            rawStderr: result.rawStderr,
+            exitCode: result.exitCode,
+            modifiedFiles: result.modifiedFiles,
+            usage: result.usage,
+            durationMs: result.durationMs
+          });
+          console.log(report);
+        }
+
+        process.exit(result.exitCode);
+      } catch (err) {
+        if (json) {
+          console.log(JSON.stringify({ ok: false, error: err.message }, null, 2));
+        } else {
+          console.error(`\n❌ Error: ${err.message}`);
+        }
+        process.exit(1);
+      }
+      break;
+    }
+
+    case 'review': {
+      let scope = 'auto';
+      let base = null;
+      let json = false;
+      let dir = process.cwd();
+      let prompt = '';
+
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--scope') {
+          scope = args[++i];
+        } else if (arg === '--base') {
+          base = args[++i];
+        } else if (arg === '--json') {
+          json = true;
+        } else if (arg === '--dir') {
+          dir = args[++i];
+        } else if (!arg.startsWith('-')) {
+          prompt = prompt ? prompt + ' ' + arg : arg;
+        } else {
+          console.error(`Error: Unknown flag '${arg}'. Run 'codex-rescue help' for usage.`);
+          process.exit(2);
+        }
+      }
+
+      if (!prompt) {
+        const stdinData = await readStdin();
+        if (stdinData) {
+          prompt = stdinData;
+        }
+      }
+
+      try {
+        const result = await executeReview({
+          prompt,
+          scope,
+          base,
+          dir
+        });
+
+        if (json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          const report = formatMarkdownReport({
+            job: result.job,
+            prompt: prompt || 'Code Review',
+            resultText: result.resultText,
+            rawStderr: result.rawStderr,
+            exitCode: result.exitCode,
+            modifiedFiles: result.modifiedFiles,
+            usage: result.usage,
+            durationMs: result.durationMs
+          });
+          console.log(report);
+        }
+
+        process.exit(result.exitCode);
+      } catch (err) {
+        if (json) {
+          console.log(JSON.stringify({ ok: false, error: err.message }, null, 2));
+        } else {
+          console.error(`\n❌ Error: ${err.message}`);
+        }
+        process.exit(1);
+      }
+      break;
+    }
+
+    case 'status': {
+      let jobId = null;
+      let json = false;
+      let dir = process.cwd();
+
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--json') {
+          json = true;
+        } else if (arg === '--dir') {
+          dir = args[++i];
+        } else if (!arg.startsWith('-')) {
+          jobId = arg;
+        }
+      }
+
+      const job = jobId ? getJob(jobId) : getLatestJob(dir);
+      if (!job) {
+        console.error(jobId ? `Job '${jobId}' not found.` : `No recorded job found for workspace '${dir}'.`);
+        process.exit(1);
+      }
+
+      if (json) {
+        console.log(JSON.stringify(job, null, 2));
+      } else {
+        console.log(formatJobStatus(job));
+      }
+      break;
+    }
+
+    case 'result': {
+      let jobId = null;
+      let dir = process.cwd();
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--dir') {
+          dir = args[++i];
+        } else if (!arg.startsWith('-')) {
+          jobId = arg;
+        }
+      }
+
+      const job = jobId ? getJob(jobId) : getLatestJob(dir);
+      if (!job) {
+        console.error(jobId ? `Job '${jobId}' not found.` : `No recorded job found for workspace '${dir}'.`);
+        process.exit(1);
+      }
+
+      if (!job.result_artifact || !fs.existsSync(job.result_artifact)) {
+        console.error(`No artifact recorded for job ${job.id}.`);
+        process.exit(1);
+      }
+
+      const content = fs.readFileSync(job.result_artifact, 'utf8');
+      console.log(content);
+      break;
+    }
+
+    case 'list': {
+      let json = false;
+      let all = false;
+      let limit = 20;
+
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--json') {
+          json = true;
+        } else if (arg === '--all') {
+          all = true;
+        } else if (arg === '--limit') {
+          limit = parseInt(args[++i], 10) || 20;
+        }
+      }
+
+      const targetWs = all ? null : process.cwd();
+      const jobs = listJobs(limit, targetWs);
+
+      if (json) {
+        console.log(JSON.stringify(jobs, null, 2));
+      } else {
+        console.log(formatJobList(jobs));
+      }
+      break;
+    }
+
+    case 'setup': {
+      const json = args.includes('--json');
+      const report = await checkSetup();
+
+      if (json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatSetupReport(report));
+      }
+
+      process.exit(report.ok ? 0 : 1);
+      break;
+    }
+
+    default: {
+      console.error(`Unknown command: '${command}'. Run 'codex-rescue help' for usage.`);
+      process.exit(2);
+    }
+  }
+}
+
+main().catch((err) => {
+  console.error(`Unexpected fatal error: ${err.message}`);
+  process.exit(1);
+});
